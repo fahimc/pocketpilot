@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.expo/
+app/node_modules/
+app/.expo/
+app/android/
+app/ios/
+bridge/node_modules/
