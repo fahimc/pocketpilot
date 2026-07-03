@@ -20,7 +20,7 @@ import {
   View,
 } from 'react-native';
 
-const STORAGE_KEY = 'pocket-pilot-config-v2';
+const STORAGE_KEY = 'pocket-pilot-state-v3';
 const DEFAULT_PORT = '4521';
 const DEFAULT_FONT_SIZE = 15;
 const MIN_FONT_SIZE = 12;
@@ -56,6 +56,9 @@ type ConnectionConfig = {
   host: string;
   port: string;
   token: string;
+  secure: boolean;
+  label: string;
+  mode: 'local' | 'remote' | 'custom';
 };
 
 type PairingPayload = {
@@ -67,21 +70,34 @@ type PairingPayload = {
   port?: number;
   token?: string;
   name?: string;
+  label?: string;
   shell?: string;
+  secure?: boolean;
+  mode?: 'local' | 'remote' | 'custom';
 };
 
 type DiscoveredBridge = {
   host: string;
   port: string;
   token: string;
-  name: string;
+  label: string;
   shell: string;
+  secure: boolean;
+  mode: 'local' | 'remote' | 'custom';
+};
+
+type PersistedState = {
+  activeConfig: ConnectionConfig;
+  savedConnections: ConnectionConfig[];
 };
 
 const defaultConfig: ConnectionConfig = {
   host: '',
   port: DEFAULT_PORT,
   token: '',
+  secure: false,
+  label: '',
+  mode: 'local',
 };
 
 function clampFontSize(fontSize: number) {
@@ -94,6 +110,23 @@ function trimTerminal(buffer: string) {
   }
 
   return buffer.slice(buffer.length - MAX_TERMINAL_CHARS);
+}
+
+function normaliseConfig(nextConfig: Partial<ConnectionConfig>): ConnectionConfig {
+  return {
+    host: typeof nextConfig.host === 'string' ? nextConfig.host : '',
+    port:
+      typeof nextConfig.port === 'string' && nextConfig.port.trim()
+        ? nextConfig.port
+        : DEFAULT_PORT,
+    token: typeof nextConfig.token === 'string' ? nextConfig.token : '',
+    secure: Boolean(nextConfig.secure),
+    label: typeof nextConfig.label === 'string' ? nextConfig.label : '',
+    mode:
+      nextConfig.mode === 'remote' || nextConfig.mode === 'custom' || nextConfig.mode === 'local'
+        ? nextConfig.mode
+        : 'local',
+  };
 }
 
 function parsePairingString(value: string): ConnectionConfig | null {
@@ -110,7 +143,14 @@ function parsePairingString(value: string): ConnectionConfig | null {
     const token = typeof parsed.token === 'string' ? parsed.token : '';
 
     if (host && token) {
-      return { host, port, token };
+      return normaliseConfig({
+        host,
+        port,
+        token,
+        secure: parsed.secure,
+        label: parsed.label || parsed.name || host,
+        mode: parsed.mode || 'custom',
+      });
     }
   } catch {
     // Continue to URL parsing.
@@ -121,9 +161,21 @@ function parsePairingString(value: string): ConnectionConfig | null {
     const host = url.searchParams.get('host')?.trim() ?? '';
     const port = url.searchParams.get('port')?.trim() || DEFAULT_PORT;
     const token = url.searchParams.get('token')?.trim() ?? '';
+    const secure = ['1', 'true', 'yes'].includes(
+      String(url.searchParams.get('secure') || '').toLowerCase(),
+    );
+    const label = url.searchParams.get('label')?.trim() || url.searchParams.get('name')?.trim() || host;
+    const modeParam = url.searchParams.get('mode');
 
     if (host && token) {
-      return { host, port, token };
+      return normaliseConfig({
+        host,
+        port,
+        token,
+        secure,
+        label,
+        mode: modeParam === 'remote' || modeParam === 'local' || modeParam === 'custom' ? modeParam : 'custom',
+      });
     }
   } catch {
     return null;
@@ -150,9 +202,10 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 export default function App() {
   const [config, setConfig] = useState<ConnectionConfig>(defaultConfig);
+  const [savedConnections, setSavedConnections] = useState<ConnectionConfig[]>([]);
   const [commandDraft, setCommandDraft] = useState('');
   const [terminalText, setTerminalText] = useState(
-    'PocketPilot is ready.\nDiscover your PC or scan the bridge QR to connect.\n',
+    'PocketPilot is ready.\nUse local pairing, import a remote pair code, or connect to a saved shortcut.\n',
   );
   const [fontSize, setFontSize] = useState(DEFAULT_FONT_SIZE);
   const [isConnected, setIsConnected] = useState(false);
@@ -163,7 +216,7 @@ export default function App() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [discoveredBridges, setDiscoveredBridges] = useState<DiscoveredBridge[]>([]);
   const [isDiscovering, setIsDiscovering] = useState(false);
-  const [discoveryMessage, setDiscoveryMessage] = useState('No discovery run yet.');
+  const [discoveryMessage, setDiscoveryMessage] = useState('No LAN discovery run yet.');
   const [isScannerVisible, setIsScannerVisible] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
@@ -176,12 +229,13 @@ export default function App() {
       try {
         const stored = await AsyncStorage.getItem(STORAGE_KEY);
         if (stored) {
-          const parsed = JSON.parse(stored) as Partial<ConnectionConfig>;
-          setConfig({
-            host: typeof parsed.host === 'string' ? parsed.host : '',
-            port: typeof parsed.port === 'string' ? parsed.port : DEFAULT_PORT,
-            token: typeof parsed.token === 'string' ? parsed.token : '',
-          });
+          const parsed = JSON.parse(stored) as Partial<PersistedState>;
+          setConfig(normaliseConfig(parsed.activeConfig || {}));
+          setSavedConnections(
+            Array.isArray(parsed.savedConnections)
+              ? parsed.savedConnections.map((item) => normaliseConfig(item))
+              : [],
+          );
         }
       } finally {
         setIsHydrated(true);
@@ -194,8 +248,13 @@ export default function App() {
       return;
     }
 
-    void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(config));
-  }, [config, isHydrated]);
+    const state: PersistedState = {
+      activeConfig: config,
+      savedConnections,
+    };
+
+    void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }, [config, isHydrated, savedConnections]);
 
   useEffect(() => {
     outputScrollRef.current?.scrollToEnd({ animated: true });
@@ -222,12 +281,17 @@ export default function App() {
   };
 
   const applyConfig = (nextConfig: ConnectionConfig) => {
-    setConfig(nextConfig);
-    appendTerminal(`\n[pairing] Loaded bridge ${nextConfig.host}:${nextConfig.port}\n`);
+    const normalised = normaliseConfig(nextConfig);
+    setConfig(normalised);
+    appendTerminal(
+      `\n[pairing] Loaded ${normalised.mode} bridge ${normalised.host}:${normalised.port}${
+        normalised.secure ? ' via secure tunnel' : ''
+      }\n`,
+    );
   };
 
   const connect = (overrideConfig?: ConnectionConfig) => {
-    const nextConfig = overrideConfig ?? config;
+    const nextConfig = normaliseConfig(overrideConfig ?? config);
     const host = nextConfig.host.trim();
     const port = nextConfig.port.trim() || DEFAULT_PORT;
     const token = nextConfig.token.trim();
@@ -240,7 +304,8 @@ export default function App() {
     socketRef.current?.close();
     setStatusText('Connecting...');
 
-    const url = `ws://${host}:${port}/terminal?token=${encodeURIComponent(token)}`;
+    const protocol = nextConfig.secure ? 'wss' : 'ws';
+    const url = `${protocol}://${host}:${port}/terminal?token=${encodeURIComponent(token)}`;
     const socket = new WebSocket(url);
     socketRef.current = socket;
 
@@ -248,7 +313,7 @@ export default function App() {
       setIsConnected(true);
       setStatusText('Connected');
       void Haptics.selectionAsync();
-      appendTerminal(`\n[bridge] Connected to ${host}:${port}\n`);
+      appendTerminal(`\n[bridge] Connected to ${host}:${port} over ${protocol.toUpperCase()}\n`);
     };
 
     socket.onmessage = (event) => {
@@ -344,7 +409,7 @@ export default function App() {
     applyConfig(parsed);
   };
 
-  const updateConfig = (key: keyof ConnectionConfig, value: string) => {
+  const updateConfig = (key: keyof ConnectionConfig, value: string | boolean) => {
     setConfig((current) => ({
       ...current,
       [key]: value,
@@ -373,8 +438,10 @@ export default function App() {
         host: payloadHost,
         port: payload.port ? String(payload.port) : DEFAULT_PORT,
         token,
-        name: payload.name || payloadHost,
+        label: payload.label || payload.name || payloadHost,
         shell: payload.shell || 'shell',
+        secure: Boolean(payload.secure),
+        mode: payload.mode || 'local',
       };
     } catch {
       return null;
@@ -417,7 +484,10 @@ export default function App() {
         const found = await Promise.all(slice.map((host) => discoverBridgeAtHost(host)));
 
         for (const bridge of found) {
-          if (bridge && !results.some((item) => item.host === bridge.host && item.port === bridge.port)) {
+          if (
+            bridge &&
+            !results.some((item) => item.host === bridge.host && item.port === bridge.port)
+          ) {
             results.push(bridge);
           }
         }
@@ -440,7 +510,10 @@ export default function App() {
   };
 
   const openScanner = async () => {
-    const permission = cameraPermission?.granted ? cameraPermission : await requestCameraPermission();
+    const permission = cameraPermission?.granted
+      ? cameraPermission
+      : await requestCameraPermission();
+
     if (!permission.granted) {
       appendTerminal('\n[pairing] Camera permission is required to scan the QR code.\n');
       return;
@@ -469,6 +542,44 @@ export default function App() {
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   };
 
+  const saveCurrentConnection = () => {
+    const next = normaliseConfig(config);
+    if (!next.host.trim() || !next.token.trim()) {
+      appendTerminal('\n[profiles] Host and token are required before saving a shortcut.\n');
+      return;
+    }
+
+    const label = next.label.trim() || next.host.trim();
+    const saved = normaliseConfig({ ...next, label });
+    setSavedConnections((current) => {
+      const filtered = current.filter(
+        (item) =>
+          !(
+            item.host === saved.host &&
+            item.port === saved.port &&
+            item.token === saved.token &&
+            item.secure === saved.secure
+          ),
+      );
+      return [saved, ...filtered].slice(0, 8);
+    });
+    appendTerminal(`\n[profiles] Saved shortcut "${label}".\n`);
+  };
+
+  const deleteSavedConnection = (saved: ConnectionConfig) => {
+    setSavedConnections((current) =>
+      current.filter(
+        (item) =>
+          !(
+            item.host === saved.host &&
+            item.port === saved.port &&
+            item.token === saved.token &&
+            item.secure === saved.secure
+          ),
+      ),
+    );
+  };
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="light" />
@@ -484,10 +595,10 @@ export default function App() {
           >
             <View style={styles.heroCard}>
               <Text style={styles.eyebrow}>POCKETPILOT</Text>
-              <Text style={styles.heroTitle}>Your PC coding agent, now on Android.</Text>
+              <Text style={styles.heroTitle}>Coding-agent access, local or on the go.</Text>
               <Text style={styles.heroCopy}>
-                Discover your PC on the local network, scan the pairing QR, and keep the
-                terminal readable and touch-friendly on a phone.
+                Discover your PC on LAN, import a remote pair code from the desktop companion,
+                and save shortcuts for your work machine, home rig, or travel laptop.
               </Text>
             </View>
 
@@ -499,7 +610,7 @@ export default function App() {
 
               <View style={styles.actionRow}>
                 <ActionButton
-                  label={isDiscovering ? 'Scanning...' : 'Discover PCs'}
+                  label={isDiscovering ? 'Scanning...' : 'Discover LAN'}
                   onPress={() => void discoverBridgesOnLan()}
                   tone="primary"
                   disabled={isDiscovering}
@@ -530,12 +641,15 @@ export default function App() {
                           host: bridge.host,
                           port: bridge.port,
                           token: bridge.token,
+                          label: bridge.label,
+                          secure: bridge.secure,
+                          mode: bridge.mode,
                         })
                       }
                       style={styles.discoveryCard}
                     >
                       <View style={styles.discoveryMeta}>
-                        <Text style={styles.discoveryName}>{bridge.name}</Text>
+                        <Text style={styles.discoveryName}>{bridge.label}</Text>
                         <Text style={styles.discoveryHost}>
                           {bridge.host}:{bridge.port}
                         </Text>
@@ -549,9 +663,58 @@ export default function App() {
 
             <View style={styles.panel}>
               <View style={styles.panelHeader}>
-                <Text style={styles.panelTitle}>Bridge Pairing</Text>
-                <Text style={styles.panelMeta}>Manual fallback</Text>
+                <View>
+                  <Text style={styles.panelTitle}>Remote Shortcuts</Text>
+                  <Text style={styles.panelMeta}>
+                    Use pair codes from the bridge desktop companion for Tailscale or reverse proxies
+                  </Text>
+                </View>
               </View>
+
+              <Text style={styles.discoveryNote}>
+                On your PC, open `http://127.0.0.1:4521/` while the bridge is running. Generate a
+                remote pair code there, then paste or scan it here and save it as a shortcut.
+              </Text>
+
+              {savedConnections.length > 0 ? (
+                <View style={styles.discoveryList}>
+                  {savedConnections.map((saved) => (
+                    <View key={`${saved.label}-${saved.host}-${saved.port}`} style={styles.savedCard}>
+                      <Pressable style={styles.savedCardMeta} onPress={() => applyConfig(saved)}>
+                        <Text style={styles.discoveryName}>{saved.label || saved.host}</Text>
+                        <Text style={styles.discoveryHost}>
+                          {saved.host}:{saved.port} {saved.secure ? '· secure' : '· direct'}
+                        </Text>
+                      </Pressable>
+                      <View style={styles.savedCardActions}>
+                        <MiniActionButton label="Load" onPress={() => applyConfig(saved)} />
+                        <MiniActionButton label="Go" onPress={() => connect(saved)} />
+                        <MiniActionButton label="Delete" onPress={() => deleteSavedConnection(saved)} />
+                      </View>
+                    </View>
+                  ))}
+                </View>
+              ) : (
+                <Text style={styles.panelMeta}>No saved shortcuts yet.</Text>
+              )}
+            </View>
+
+            <View style={styles.panel}>
+              <View style={styles.panelHeader}>
+                <Text style={styles.panelTitle}>Connection Details</Text>
+                <Text style={styles.panelMeta}>Manual fallback and profile editor</Text>
+              </View>
+
+              <Text style={styles.fieldLabel}>Shortcut Label</Text>
+              <TextInput
+                autoCapitalize="words"
+                autoCorrect={false}
+                onChangeText={(value) => updateConfig('label', value)}
+                placeholder="Work PC or Home Rig"
+                placeholderTextColor="#7091ac"
+                style={styles.input}
+                value={config.label}
+              />
 
               <Text style={styles.fieldLabel}>PC Host</Text>
               <TextInput
@@ -559,7 +722,7 @@ export default function App() {
                 autoCorrect={false}
                 keyboardType="url"
                 onChangeText={(value) => updateConfig('host', value)}
-                placeholder="192.168.1.24"
+                placeholder="pc-name.tailnet.ts.net or 192.168.1.24"
                 placeholderTextColor="#7091ac"
                 style={styles.input}
                 value={config.host}
@@ -593,8 +756,44 @@ export default function App() {
               </View>
 
               <View style={styles.actionRow}>
+                <ToggleChip
+                  active={!config.secure}
+                  label="Direct ws"
+                  onPress={() => updateConfig('secure', false)}
+                />
+                <ToggleChip
+                  active={config.secure}
+                  label="Secure wss"
+                  onPress={() => updateConfig('secure', true)}
+                />
+              </View>
+
+              <View style={styles.actionRow}>
+                <ToggleChip
+                  active={config.mode === 'local'}
+                  label="Local"
+                  onPress={() => updateConfig('mode', 'local')}
+                />
+                <ToggleChip
+                  active={config.mode === 'remote'}
+                  label="Remote"
+                  onPress={() => updateConfig('mode', 'remote')}
+                />
+                <ToggleChip
+                  active={config.mode === 'custom'}
+                  label="Custom"
+                  onPress={() => updateConfig('mode', 'custom')}
+                />
+              </View>
+
+              <View style={styles.actionRow}>
                 <ActionButton label="Connect" onPress={() => connect()} tone="primary" />
                 <ActionButton label="Disconnect" onPress={disconnect} tone="secondary" />
+              </View>
+
+              <View style={styles.actionRow}>
+                <ActionButton label="Save Shortcut" onPress={saveCurrentConnection} tone="secondary" />
+                <ActionButton label="Paste Pair Code" onPress={() => void pastePairingFromClipboard()} tone="secondary" />
               </View>
             </View>
 
@@ -729,7 +928,9 @@ export default function App() {
             <View style={styles.panelHeader}>
               <View>
                 <Text style={styles.panelTitle}>Scan Pairing QR</Text>
-                <Text style={styles.panelMeta}>Point your phone at the QR shown in the PC bridge</Text>
+                <Text style={styles.panelMeta}>
+                  Point your phone at a local or remote pairing code from the PC bridge
+                </Text>
               </View>
               <Pressable onPress={() => setIsScannerVisible(false)} style={styles.toolbarButton}>
                 <Text style={styles.toolbarButtonLabel}>Close</Text>
@@ -785,6 +986,30 @@ function MiniButton({ label, onPress }: { label: string; onPress: () => void }) 
   return (
     <Pressable onPress={onPress} style={styles.miniButton}>
       <Text style={styles.miniButtonLabel}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function MiniActionButton({ label, onPress }: { label: string; onPress: () => void }) {
+  return (
+    <Pressable onPress={onPress} style={styles.miniActionButton}>
+      <Text style={styles.miniActionLabel}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function ToggleChip({
+  active,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable onPress={onPress} style={[styles.toggleChip, active ? styles.toggleChipActive : null]}>
+      <Text style={[styles.toggleChipLabel, active ? styles.toggleChipLabelActive : null]}>{label}</Text>
     </Pressable>
   );
 }
@@ -969,6 +1194,53 @@ const styles = StyleSheet.create({
     color: '#7dd3fc',
     fontSize: 12,
     fontWeight: '700',
+  },
+  savedCard: {
+    borderRadius: 16,
+    padding: 14,
+    backgroundColor: '#0f2232',
+    borderWidth: 1,
+    borderColor: '#23455e',
+    gap: 12,
+  },
+  savedCardMeta: {
+    gap: 2,
+  },
+  savedCardActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  miniActionButton: {
+    borderRadius: 12,
+    backgroundColor: '#17354d',
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  miniActionLabel: {
+    color: '#e2edf6',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  toggleChip: {
+    flex: 1,
+    borderRadius: 999,
+    backgroundColor: '#122c42',
+    borderWidth: 1,
+    borderColor: '#2a4b64',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  toggleChipActive: {
+    backgroundColor: '#f59e0b',
+    borderColor: '#f59e0b',
+  },
+  toggleChipLabel: {
+    color: '#d7e7f4',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  toggleChipLabelActive: {
+    color: '#101418',
   },
   fontControls: {
     flexDirection: 'row',

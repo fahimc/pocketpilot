@@ -9,6 +9,7 @@ PocketPilot is the Android client for a phone-first coding-agent terminal.
 - Lets you launch tools like `codex` and `opencode`
 - Adds mobile-friendly controls for large text, quick commands, and terminal keys
 - Supports LAN discovery, QR pairing, and pairing-code paste flows
+- Supports saved remote shortcuts and secure `wss` tunnel profiles
 
 ## Run in development
 

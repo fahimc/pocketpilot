@@ -16,6 +16,10 @@ Optional environment variables:
 $env:BRIDGE_TOKEN="choose-a-long-random-token"
 $env:PORT="4521"
 $env:BRIDGE_SHELL="pwsh.exe"
+$env:BRIDGE_REMOTE_HOST="pc-name.tailnet.ts.net"
+$env:BRIDGE_REMOTE_PORT="4521"
+$env:BRIDGE_REMOTE_SECURE="false"
+$env:BRIDGE_REMOTE_LABEL="Work Laptop"
 npm start
 ```
 
@@ -24,12 +28,14 @@ npm start
 - WebSocket: `ws://<pc-ip>:4521/terminal?token=<token>`
 - Health check: `http://<pc-ip>:4521/health`
 - Pairing metadata for LAN discovery: `http://<pc-ip>:4521/pairing`
+- Desktop companion page: `http://127.0.0.1:4521/`
 
 ## Pairing options
 
 - Tap `Discover PCs` in the app while both devices are on the same LAN
 - Scan the QR code printed by the bridge in the PC terminal
 - Copy the printed `pocketpilot://pair?...` URL and paste it in the app
+- Open the desktop companion page and generate a remote pairing code for Tailscale or a reverse proxy
 
 ## Notes
 
